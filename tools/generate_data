@@ -1,0 +1,175 @@
+import datetime
+import json
+import re
+from pathlib import Path
+import openpyxl
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE = ROOT / "Updated CS Identification all.xlsx"
+OUT = ROOT / "data.json"
+
+def clean(v):
+    if v is None:
+        return ""
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v).strip()
+
+def format_size_mm(v):
+    s = clean(v)
+    if not s:
+        return ""
+    if re.search(r"mm", s, re.I):
+        return s
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*(?:dia|diameter)$", s, re.I)
+    if m:
+        return f"Ø{m.group(1)} mm"
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*[x×]\s*(\d+(?:\.\d+)?)$", s, re.I)
+    if m:
+        return f"{m.group(1)} × {m.group(2)} mm"
+    return f"{s} mm"
+
+def normalize_gha(v):
+    value = clean(v).upper()
+    return "NGHA" if value in ("NGH", "NGHA") else value
+
+if not SOURCE.exists():
+    raise FileNotFoundError(
+        f"Required source workbook missing: {SOURCE.name}. "
+        "Upload this exact filename to the repository root."
+    )
+
+wb = openpyxl.load_workbook(SOURCE, data_only=True, read_only=True)
+if "Confined Space Location List" not in wb.sheetnames:
+    raise KeyError("Required sheet 'Confined Space Location List' not found.")
+
+ws = wb["Confined Space Location List"]
+ignition_headers = [clean(ws.cell(8, c).value) for c in range(19, 38) if clean(ws.cell(8, c).value)]
+locations = []
+current_section = ""
+
+for r in range(9, ws.max_row + 1):
+    sec = clean(ws.cell(r, 2).value)
+    if sec:
+        current_section = sec
+    ident = clean(ws.cell(r, 4).value)
+    if not ident:
+        continue
+    x = {
+        "sr": clean(ws.cell(r, 3).value),
+        "id": ident,
+        "description": clean(ws.cell(r, 5).value),
+        "area": clean(ws.cell(r, 6).value),
+        "location": clean(ws.cell(r, 7).value),
+        "outdoor": clean(ws.cell(r, 8).value),
+        "large": clean(ws.cell(r, 9).value),
+        "restricted": clean(ws.cell(r, 10).value),
+        "occupancy": clean(ws.cell(r, 11).value),
+        "hazardous": clean(ws.cell(r, 12).value),
+        "engulf": clean(ws.cell(r, 13).value),
+        "converging": clean(ws.cell(r, 14).value),
+        "otherHazard": clean(ws.cell(r, 15).value),
+        "confined": clean(ws.cell(r, 16).value),
+        "gha": normalize_gha(ws.cell(r, 17).value),
+        "zone": clean(ws.cell(r, 18).value),
+        "section": current_section,
+        "size": format_size_mm(ws.cell(r, 40).value),
+    }
+    x["ignitionStatus"] = {
+        h: clean(ws.cell(r, 19 + i).value) for i, h in enumerate(ignition_headers)
+    }
+    x["ignition"] = [
+        h for h, v in x["ignitionStatus"].items()
+        if v.strip() in ("✓", "✔", "Yes", "YES", "Y", "1", "True", "TRUE")
+    ]
+    x["availableSources"] = clean(ws.cell(r, 37).value)
+    x["sop"] = clean(ws.cell(r, 38).value)
+    x["hirac"] = clean(ws.cell(r, 39).value)
+    locations.append(x)
+
+if not locations:
+    raise ValueError("Workbook was read, but no confined-space locations were found.")
+
+sections = {}
+for x in locations:
+    sections[x["section"]] = sections.get(x["section"], 0) + 1
+
+entries = {}
+def entry_department(sheet_dep, ident, area, location):
+    u = f"{ident} {area} {location}".upper()
+    if "PICKLING" in u:
+        return "PICKLING"
+    if "ARP" in u:
+        return "ARP"
+    aliases = {
+        "ADMINISTRATIVE": "ADMIN",
+        "ADMIN": "ADMIN",
+        "CRM": "CRM",
+        "CGL": "CGL",
+        "CCL": "CCL",
+        "UTILITY": "UTILITY",
+        "PICKLING": "PICKLING",
+        "ARP": "ARP",
+    }
+    return aliases.get(sheet_dep.upper().strip(), sheet_dep.upper().strip())
+
+for s in wb.sheetnames[2:]:
+    sheet = wb[s]
+    header = None
+    for r in range(1, min(15, sheet.max_row + 1)):
+        vals = [clean(sheet.cell(r, c).value).lower() for c in range(1, sheet.max_column + 1)]
+        if any("identification no" in v for v in vals):
+            header = r
+            break
+    if header is None:
+        continue
+
+    sheet_dep = ""
+    for c in range(1, sheet.max_column + 1):
+        v = clean(sheet.cell(5, c).value)
+        if v and "as on date" not in v.lower() and v.lower() not in ("department", "department -"):
+            sheet_dep = v.replace("Department -", "").strip()
+            if sheet_dep:
+                break
+    if not sheet_dep:
+        sheet_dep = s.replace(" C.S.ENTRY", "").strip()
+
+    for r in range(header + 1, sheet.max_row + 1):
+        ident = clean(sheet.cell(r, 3).value)
+        if not ident:
+            continue
+        area = clean(sheet.cell(r, 5).value)
+        location = clean(sheet.cell(r, 6).value)
+        dep = entry_department(sheet_dep, ident, area, location)
+        entries.setdefault(dep, []).append({
+            "department": dep,
+            "sr": clean(sheet.cell(r, 2).value),
+            "id": ident,
+            "description": clean(sheet.cell(r, 4).value),
+            "area": area,
+            "location": location,
+            "outdoor": clean(sheet.cell(r, 7).value),
+            "gha": normalize_gha(sheet.cell(r, 8).value),
+            "zone": clean(sheet.cell(r, 9).value),
+            "size": format_size_mm(sheet.cell(r, 10).value),
+        })
+
+preferred = ["CRM", "PICKLING", "ARP", "CGL", "CCL", "UTILITY", "ADMIN"]
+departments = [d for d in preferred if d in entries or d in sections]
+for d in departments:
+    entries.setdefault(d, [])
+
+data = {
+    "generatedAt": datetime.datetime.now().strftime("%d %b %Y %H:%M"),
+    "sourceWorkbook": SOURCE.name,
+    "recordCount": len(locations),
+    "locations": locations,
+    "sections": sections,
+    "departments": departments,
+    "entries": {d: entries[d] for d in departments},
+    "ignitionHeaders": ignition_headers,
+}
+OUT.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+print(f"Source workbook: {SOURCE.name}")
+print(f"Generated {OUT.name}: {len(locations)} locations; "
+      f"{sum(len(v) for v in entries.values())} department entry rows.")
